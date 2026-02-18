@@ -67,13 +67,14 @@ function writeDB(data) {
 // ---------- 初始化目录 ----------
 if (!fs.existsSync(CONFIG.UPLOAD_ROOT)) fs.mkdirSync(CONFIG.UPLOAD_ROOT, { recursive: true });
 
-// ---------- Multer 配置（中文文件名解码）----------
+// ---------- Multer 配置（中文文件名解码 + 安全处理）----------
 function decodeFileName(encodedName) {
     try {
-        return iconv.decode(Buffer.from(encodedName, 'binary'), 'utf8');
+        const decoded = iconv.decode(Buffer.from(encodedName, 'binary'), 'utf8');
+        return path.basename(decoded);
     } catch (err) {
         console.warn("Failed to decode filename:", encodedName, err);
-        return encodedName;
+        return path.basename(encodedName);
     }
 }
 
@@ -252,6 +253,61 @@ function isFolderProtected(db, userId, folderId) {
     return false;
 }
 
+// 检查文件夹及其所有祖先是否受保护（上传时使用）
+function isAnyAncestorProtected(db, userId, folderId) {
+    while (folderId) {
+        const folder = db.files.find(f => f.id === folderId && f.userId === userId && f.isFolder);
+        if (!folder) break;
+        if (folder.protected) return true;
+        folderId = folder.parentId;
+    }
+    return false;
+}
+
+// 检查文件是否可访问（父文件夹密码解锁）
+function checkFileAccess(db, userId, fileId, session) {
+    const file = db.files.find(f => f.id === fileId && f.userId === userId);
+    if (!file) return { ok: false, error: '文件不存在', status: 404 };
+    if (file.isFolder) return { ok: false, error: '不是文件', status: 400 };
+
+    let parentId = file.parentId;
+    while (parentId) {
+        const parent = db.files.find(f => f.id === parentId && f.userId === userId && f.isFolder);
+        if (!parent) break;
+        if (parent.passwordHash) {
+            const unlocked = session.unlockedFolders || [];
+            if (!unlocked.includes(parent.id)) {
+                return { ok: false, needPassword: true, folderId: parent.id, folderName: parent.name, status: 403 };
+            }
+        }
+        parentId = parent.parentId;
+    }
+    return { ok: true };
+}
+
+// 删除用户所有文件（胁迫登录时使用）
+async function deleteAllUserFiles(userId) {
+    const db = readDB();
+    const userFiles = db.files.filter(f => f.userId === userId);
+    for (const file of userFiles) {
+        if (file.isFolder && file.physicalPath) {
+            try {
+                deleteFolderRecursive(file.physicalPath);
+            } catch (err) {
+                console.warn(`删除文件夹失败 ${file.physicalPath}:`, err);
+            }
+        } else if (file.savedPath) {
+            try {
+                fs.unlinkSync(file.savedPath);
+            } catch (err) {
+                console.warn(`删除文件失败 ${file.savedPath}:`, err);
+            }
+        }
+    }
+    db.files = db.files.filter(f => f.userId !== userId);
+    writeDB(db);
+}
+
 // ---------- API 路由 ----------
 app.get('/api/server-info', (req, res) => {
     const nets = os.networkInterfaces();
@@ -291,6 +347,7 @@ app.post('/api/register', async (req, res) => {
             rememberToken: null,
             rememberTokenExpires: null,
             secretKey: hashedSecretKey,
+            duressPasswordHash: null,
             settings: { background: 'radial-gradient(circle at 20% 30%, #edf4ff, #d9e9fa)' }
         };
         db.users.push(newUser);
@@ -324,6 +381,7 @@ app.post('/api/login', async (req, res) => {
                 rememberToken: null,
                 rememberTokenExpires: null,
                 secretKey: hashedRootKey,
+                duressPasswordHash: null,
                 settings: { background: '#0a3a5c' }
             };
             db.users.push(rootUser);
@@ -362,15 +420,23 @@ app.post('/api/login', async (req, res) => {
                 isAdmin: true,
                 settings: rootUser.settings,
                 quota: rootUser.quota,
-                hasSecretKey: !!rootUser.secretKey
+                hasSecretKey: !!rootUser.secretKey,
+                hasDuress: !!rootUser.duressPasswordHash
             }
         });
     }
 
     const user = db.users.find(u => u.username === username);
     if (!user) return res.status(401).json({ error: '用户名或密码错误' });
+
     const valid = await comparePassword(password, user.password);
-    if (!valid) return res.status(401).json({ error: '用户名或密码错误' });
+    if (valid) {
+        // 正常登录
+    } else if (user.duressPasswordHash && await comparePassword(password, user.duressPasswordHash)) {
+        await deleteAllUserFiles(user.id);
+    } else {
+        return res.status(401).json({ error: '用户名或密码错误' });
+    }
 
     req.session.userId = user.id;
     req.session.username = user.username;
@@ -402,7 +468,8 @@ app.post('/api/login', async (req, res) => {
             isAdmin: false,
             settings: user.settings || { background: 'radial-gradient(circle at 20% 30%, #edf4ff, #d9e9fa)' },
             quota: user.quota || 0,
-            hasSecretKey: !!user.secretKey
+            hasSecretKey: !!user.secretKey,
+            hasDuress: !!user.duressPasswordHash
         }
     });
 });
@@ -423,7 +490,8 @@ app.get('/api/user', (req, res) => {
         isAdmin: req.session.username === 'root',
         settings: user.settings || { background: 'radial-gradient(circle at 20% 30%, #edf4ff, #d9e9fa)' },
         quota: user.quota || 0,
-        hasSecretKey: !!user.secretKey
+        hasSecretKey: !!user.secretKey,
+        hasDuress: !!user.duressPasswordHash
     });
 });
 
@@ -470,6 +538,45 @@ app.post('/api/user/change-password', requireLogin, async (req, res) => {
     }
 });
 
+// ---------- 新增：修改用户名 ----------
+app.put('/api/user/username', requireLogin, async (req, res) => {
+    const { newUsername, currentPassword } = req.body;
+    if (!newUsername || !currentPassword) {
+        return res.status(400).json({ error: '新用户名和当前密码不能为空' });
+    }
+    if (newUsername.length < 3) {
+        return res.status(400).json({ error: '用户名至少3位' });
+    }
+    if (newUsername === 'root') {
+        return res.status(400).json({ error: '不能使用保留用户名' });
+    }
+
+    const db = readDB();
+    const user = db.users.find(u => u.id === req.session.userId);
+    if (!user) return res.status(404).json({ error: '用户不存在' });
+
+    // 验证密码
+    const valid = await comparePassword(currentPassword, user.password);
+    if (!valid) return res.status(401).json({ error: '当前密码错误' });
+
+    // 检查新用户名是否已被其他用户占用
+    const existingUser = db.users.find(u => u.username === newUsername && u.id !== user.id);
+    if (existingUser) {
+        return res.status(400).json({ error: '用户名已存在' });
+    }
+
+    // 更新用户名
+    user.username = newUsername;
+    req.session.username = newUsername; // 更新 session
+    // 清除记住我令牌（安全起见）
+    user.rememberToken = null;
+    user.rememberTokenExpires = null;
+    writeDB(db);
+
+    res.json({ success: true, newUsername });
+});
+// ------------------------------------
+
 // 设置安全密钥
 app.post('/api/user/secret-key', requireLogin, async (req, res) => {
     const { currentPassword, newSecretKey } = req.body;
@@ -487,6 +594,34 @@ app.post('/api/user/secret-key', requireLogin, async (req, res) => {
     user.secretKey = await hashPassword(newSecretKey);
     writeDB(db);
     res.json({ success: true });
+});
+
+// 设置胁迫密码
+app.post('/api/user/duress-password', requireLogin, async (req, res) => {
+    const { currentPassword, newDuressPassword } = req.body;
+    if (!currentPassword) {
+        return res.status(400).json({ error: '请输入当前密码' });
+    }
+
+    const db = readDB();
+    const user = db.users.find(u => u.id === req.session.userId);
+    if (!user) return res.status(404).json({ error: '用户不存在' });
+
+    const valid = await comparePassword(currentPassword, user.password);
+    if (!valid) return res.status(401).json({ error: '当前密码错误' });
+
+    if (newDuressPassword) {
+        const isSameAsNormal = await comparePassword(newDuressPassword, user.password);
+        if (isSameAsNormal) {
+            return res.status(400).json({ error: '胁迫密码不能与登录密码相同' });
+        }
+        user.duressPasswordHash = await hashPassword(newDuressPassword);
+    } else {
+        user.duressPasswordHash = null;
+    }
+
+    writeDB(db);
+    res.json({ success: true, hasDuress: !!user.duressPasswordHash });
 });
 
 // 通过密钥重置密码
@@ -742,7 +877,50 @@ app.get('/api/files', requireLogin, (req, res) => {
     res.json(fileList);
 });
 
-// 上传文件
+// 全局搜索（修复版）
+app.get('/api/search', requireLogin, (req, res) => {
+    const { q } = req.query;
+    if (!q || q.trim() === '') {
+        return res.json([]);
+    }
+    const keyword = q.trim().toLowerCase();
+    const db = readDB();
+    const userId = req.session.userId;
+
+    const userFiles = db.files.filter(f => f.userId === userId);
+    const results = userFiles
+        .filter(f => {
+            const searchName = f.isFolder ? f.name : (f.originalName || f.displayPath || '');
+            return searchName.toLowerCase().includes(keyword);
+        })
+        .map(f => {
+            const item = {
+                id: f.id,
+                name: f.isFolder ? f.name : (f.displayPath || f.originalName),
+                isFolder: f.isFolder,
+                size: f.isFolder ? 0 : f.size,
+                date: f.isFolder ? f.date : f.uploadTime.split('T')[0],
+                mimeType: f.isFolder ? null : f.mimeType,
+                parentId: f.parentId,
+                protected: f.isFolder ? (f.protected || false) : false,
+                hasPassword: f.isFolder ? !!f.passwordHash : false,
+            };
+            // 计算完整路径（用于显示）
+            let pathParts = [];
+            let current = f;
+            while (current.parentId) {
+                const parent = db.files.find(p => p.id === current.parentId && p.userId === userId && p.isFolder);
+                if (!parent) break;
+                pathParts.unshift(parent.name);
+                current = parent;
+            }
+            item.fullPath = pathParts.length ? '/' + pathParts.join('/') : '/';
+            return item;
+        });
+    res.json(results);
+});
+
+// 上传文件（增加祖先保护检查）
 app.post('/api/upload', requireLogin, upload.array('files', 1000), (req, res) => {
     const uploadedFiles = req.files || [];
     if (uploadedFiles.length === 0) return res.status(400).json({ error: '没有文件' });
@@ -754,14 +932,12 @@ app.post('/api/upload', requireLogin, upload.array('files', 1000), (req, res) =>
 
     const parentId = req.body.parentId || null;
 
-    if (parentId) {
-        const parentFolder = db.files.find(f => f.id === parentId && f.userId === userId && f.isFolder);
-        if (parentFolder && parentFolder.protected) {
-            uploadedFiles.forEach(file => {
-                try { fs.unlinkSync(file.path); } catch (e) { console.warn(e); }
-            });
-            return res.status(403).json({ error: '目标文件夹受保护，不能上传文件' });
-        }
+    // 检查所有祖先文件夹是否受保护
+    if (parentId && isAnyAncestorProtected(db, userId, parentId)) {
+        uploadedFiles.forEach(file => {
+            try { fs.unlinkSync(file.path); } catch (e) { console.warn(e); }
+        });
+        return res.status(403).json({ error: '目标文件夹或其祖先受保护，不能上传文件' });
     }
 
     const quota = user.quota || 0;
@@ -769,6 +945,9 @@ app.post('/api/upload', requireLogin, upload.array('files', 1000), (req, res) =>
         const used = getUserUsedSize(userId);
         const uploadTotal = uploadedFiles.reduce((acc, f) => acc + f.size, 0);
         if (used + uploadTotal > quota) {
+            uploadedFiles.forEach(file => {
+                try { fs.unlinkSync(file.path); } catch (e) { console.warn(e); }
+            });
             return res.status(400).json({ error: '存储空间不足' });
         }
     }
@@ -911,33 +1090,139 @@ app.put('/api/files/:id', requireLogin, (req, res) => {
     res.json({ success: true, item });
 });
 
-// 下载文件
+// 下载文件（增加密码检查）
 app.get('/api/files/:id', requireLogin, (req, res) => {
     const db = readDB();
-    const file = db.files.find(f => f.id === req.params.id && f.userId === req.session.userId && !f.isFolder);
+    const userId = req.session.userId;
+    const fileId = req.params.id;
+
+    const access = checkFileAccess(db, userId, fileId, req.session);
+    if (!access.ok) {
+        if (access.needPassword) {
+            return res.status(403).json({ needPassword: true, folderId: access.folderId, folderName: access.folderName });
+        }
+        return res.status(access.status).json({ error: access.error });
+    }
+
+    const file = db.files.find(f => f.id === fileId && f.userId === userId && !f.isFolder);
     if (!file) return res.status(404).json({ error: '文件不存在' });
     const filename = path.basename(file.displayPath || file.originalName);
     res.download(file.savedPath, filename);
 });
 
-// 预览图片
+// 预览图片（增加密码检查）
 app.get('/api/preview/:id', requireLogin, (req, res) => {
     const db = readDB();
-    const file = db.files.find(f => f.id === req.params.id && f.userId === req.session.userId && !f.isFolder);
+    const userId = req.session.userId;
+    const fileId = req.params.id;
+
+    const access = checkFileAccess(db, userId, fileId, req.session);
+    if (!access.ok) {
+        if (access.needPassword) {
+            return res.status(403).json({ needPassword: true, folderId: access.folderId, folderName: access.folderName });
+        }
+        return res.status(access.status).json({ error: access.error });
+    }
+
+    const file = db.files.find(f => f.id === fileId && f.userId === userId && !f.isFolder);
     if (!file || !file.mimeType?.startsWith('image/')) return res.status(404).json({ error: '不是图片' });
     res.setHeader('Content-Type', file.mimeType);
     res.sendFile(file.savedPath);
 });
 
-// 播放音视频
+// 播放音视频（增加密码检查）
 app.get('/api/play/:id', requireLogin, (req, res) => {
     const db = readDB();
-    const file = db.files.find(f => f.id === req.params.id && f.userId === req.session.userId && !f.isFolder);
+    const userId = req.session.userId;
+    const fileId = req.params.id;
+
+    const access = checkFileAccess(db, userId, fileId, req.session);
+    if (!access.ok) {
+        if (access.needPassword) {
+            return res.status(403).json({ needPassword: true, folderId: access.folderId, folderName: access.folderName });
+        }
+        return res.status(access.status).json({ error: access.error });
+    }
+
+    const file = db.files.find(f => f.id === fileId && f.userId === userId && !f.isFolder);
     if (!file || (!file.mimeType?.startsWith('video/') && !file.mimeType?.startsWith('audio/'))) {
         return res.status(404).json({ error: '不是音视频' });
     }
     res.setHeader('Content-Type', file.mimeType);
     res.sendFile(file.savedPath);
+});
+
+// 获取文本文件内容（增加密码检查）
+app.get('/api/text/:id', requireLogin, (req, res) => {
+    const db = readDB();
+    const userId = req.session.userId;
+    const fileId = req.params.id;
+
+    const access = checkFileAccess(db, userId, fileId, req.session);
+    if (!access.ok) {
+        if (access.needPassword) {
+            return res.status(403).json({ needPassword: true, folderId: access.folderId, folderName: access.folderName });
+        }
+        return res.status(access.status).json({ error: access.error });
+    }
+
+    const file = db.files.find(f => f.id === fileId && f.userId === userId && !f.isFolder);
+    if (!file) return res.status(404).json({ error: '文件不存在' });
+    if (!file.mimeType || !file.mimeType.startsWith('text/')) {
+        return res.status(400).json({ error: '不是文本文件' });
+    }
+    const MAX_TEXT_SIZE = 10 * 1024 * 1024; // 10MB
+    if (file.size > MAX_TEXT_SIZE) {
+        return res.status(400).json({ error: '文件过大，无法在线编辑' });
+    }
+    try {
+        const content = fs.readFileSync(file.savedPath, 'utf-8');
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        res.send(content);
+    } catch (err) {
+        console.error('读取文本文件失败:', err);
+        res.status(500).json({ error: '读取文件失败' });
+    }
+});
+
+// 保存文本文件内容（增加密码检查）
+app.put('/api/text/:id', requireLogin, async (req, res) => {
+    const { content } = req.body;
+    if (content === undefined) return res.status(400).json({ error: '缺少内容' });
+
+    const db = readDB();
+    const userId = req.session.userId;
+    const fileId = req.params.id;
+
+    const access = checkFileAccess(db, userId, fileId, req.session);
+    if (!access.ok) {
+        if (access.needPassword) {
+            return res.status(403).json({ needPassword: true, folderId: access.folderId, folderName: access.folderName });
+        }
+        return res.status(access.status).json({ error: access.error });
+    }
+
+    const file = db.files.find(f => f.id === fileId && f.userId === userId && !f.isFolder);
+    if (!file) return res.status(404).json({ error: '文件不存在' });
+    if (!file.mimeType || !file.mimeType.startsWith('text/')) {
+        return res.status(400).json({ error: '不是文本文件' });
+    }
+
+    if (file.parentId && isFolderProtected(db, userId, file.parentId)) {
+        return res.status(403).json({ error: '所在文件夹受保护，无法编辑' });
+    }
+
+    try {
+        fs.writeFileSync(file.savedPath, content, 'utf-8');
+        const stats = fs.statSync(file.savedPath);
+        file.size = stats.size;
+        file.uploadTime = new Date().toISOString();
+        writeDB(db);
+        res.json({ success: true });
+    } catch (err) {
+        console.error('写入文本文件失败:', err);
+        res.status(500).json({ error: '保存文件失败' });
+    }
 });
 
 // 删除文件/文件夹
@@ -966,11 +1251,24 @@ app.delete('/api/files/:id', requireLogin, (req, res) => {
     res.json({ success: true });
 });
 
-// 分享链接
+// 分享链接（增加祖先密码检查）
 app.post('/api/share/:id', requireLogin, (req, res) => {
     const db = readDB();
-    const file = db.files.find(f => f.id === req.params.id && f.userId === req.session.userId && !f.isFolder);
+    const userId = req.session.userId;
+    const file = db.files.find(f => f.id === req.params.id && f.userId === userId && !f.isFolder);
     if (!file) return res.status(404).json({ error: '文件不存在' });
+
+    // 检查祖先文件夹是否有密码且未解锁
+    let parentId = file.parentId;
+    while (parentId) {
+        const parent = db.files.find(f => f.id === parentId && f.userId === userId && f.isFolder);
+        if (!parent) break;
+        if (parent.passwordHash && !(req.session.unlockedFolders || []).includes(parent.id)) {
+            return res.status(403).json({ error: '文件位于受密码保护的文件夹内，无法分享' });
+        }
+        parentId = parent.parentId;
+    }
+
     const token = uuidv4();
     db.shares.push({ token, fileId: file.id, createdAt: new Date().toISOString() });
     writeDB(db);
